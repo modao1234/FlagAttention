@@ -65,6 +65,25 @@ def _prefill_mfma_kwargs(is_hip_backend: bool) -> dict:
         return {}
     return {"matrix_instr_nonkdim": _PREFILL_MFMA_NONKDIM}
 
+
+# Tokens per KV tile in the decode loop. The dot's MFMA operands are staged
+# through LDS, so a full 128-token tile costs 32 KB -- with 64 KB per CU that
+# caps residency at two workgroups, i.e. ONE wavefront per SIMD, leaving no
+# second wave to cover KV-load latency. A 64-token tile halves the staging to
+# 16 KB (four workgroups, two waves/SIMD) and measured 1.25x-1.43x once the
+# grid is large enough to actually contend for CUs. 128 reproduces the upstream
+# single-tile loop exactly.
+_DECODE_SUB_K = int(os.environ.get("FLAG_ATTN_HYGON_DECODE_SUB_K", "64"))
+
+# Grid size (in workgroups) above which sub-tiling pays off. Below it the GPU
+# holds every workgroup resident, so there is no occupancy to win and the extra
+# serial softmax step per page is pure cost: measured 13-23% slower at batch
+# 1-8, break-even at batch ~8-12, and a win from 12 up. 80 CUs * 2 resident
+# full-tile workgroups == 160.
+_DECODE_SUB_K_MIN_GRID = int(
+    os.environ.get("FLAG_ATTN_HYGON_DECODE_SUB_K_MIN_GRID", "160")
+)
+
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 
@@ -830,6 +849,7 @@ def _gqa_sparse_decode_kernel(
     USE_PDL: tl.constexpr,
     TIGHT_H: tl.constexpr,  # BLOCK_SIZE_H == gqa_group_size exactly
     COALESCE_K: tl.constexpr,  # load K contiguously and transpose in-register
+    SUB_K: tl.constexpr,  # tokens per KV tile; BLOCK_SIZE_K == one tile (HEAD)
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # split-K over the topk dimension: pid(0) folds (query-token, chunk).
@@ -858,7 +878,12 @@ def _gqa_sparse_decode_kernel(
     real_topk = tl.minimum(max_topk, num_blocks)
     chunk_end_topk = tl.minimum(chunk_end_compiletime, real_topk)
 
-    off_n = tl.arange(0, BLOCK_SIZE_K)
+    # KV tile height. One page (BLOCK_SIZE_K tokens) is consumed in
+    # BLOCK_SIZE_K // SUB_K tiles; SUB_K == BLOCK_SIZE_K is the single-tile
+    # path. A shorter tile shrinks the LDS the MFMA operand staging needs,
+    # which is what sets occupancy here -- see the wrapper for the numbers.
+    NUM_SUB: tl.constexpr = BLOCK_SIZE_K // SUB_K
+    off_n = tl.arange(0, SUB_K)
     off_d = tl.arange(0, BLOCK_SIZE_D)
     d_mask = off_d < head_dim
     bt_row = block_table_ptr + req_id * stride_bt_b
@@ -897,88 +922,96 @@ def _gqa_sparse_decode_kernel(
         cur_idx_ptr = cur_idx_ptr + stride_tk
         c = blk * BLOCK_SIZE_K
         page = tl.load(bt_row + blk).to(tl.int64)
-        pos = c + off_n
-        pos_mask = pos < kv_len
         # One base address shared by the K and V loads.
         kv_base = kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
-        if COALESCE_K:
-            # kv_cache is [..., pos, d] with stride_kv_d == 1, so loading K as
-            # [D, K] makes the tile's fastest-varying axis walk stride_kv_pos
-            # (256 elems == 512 B here) and every cache line delivers 2 useful
-            # bytes. Load it [K, D] like V -- contiguous along d -- and let
-            # tl.trans supply the [D, K] operand tl.dot needs.
-            k_kd = tl.load(
+        for sub in tl.static_range(NUM_SUB):
+            # Token offset of this tile inside the page. At NUM_SUB == 1 this
+            # is 0 and every expression below matches the single-tile form.
+            sub_off = sub * SUB_K
+            pos = c + sub_off + off_n
+            pos_mask = pos < kv_len
+            row_off = (sub_off + off_n) * stride_kv_pos
+            if COALESCE_K:
+                # kv_cache is [..., pos, d] with stride_kv_d == 1, so loading K
+                # as [D, K] makes the tile's fastest-varying axis walk
+                # stride_kv_pos (256 elems == 512 B here) and every cache line
+                # delivers 2 useful bytes. Load it [K, D] like V -- contiguous
+                # along d -- and let tl.trans supply the [D, K] operand tl.dot
+                # needs.
+                k_kd = tl.load(
+                    kv_base
+                    + row_off[:, None]
+                    + off_d[None, :] * stride_kv_d,
+                    mask=pos_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                if USE_FP8:
+                    k_kd = k_kd.to(q.dtype)
+                    if KV_SCALE_MODE == 1:
+                        k_kd = (k_kd * tl.load(k_scale_ptr)).to(q.dtype)
+                    elif KV_SCALE_MODE == 2:
+                        k_scale = tl.load(
+                            k_scale_ptr
+                            + pid_kh * stride_ks_h
+                            + (page * BLOCK_SIZE_K + sub_off + off_n)
+                            * stride_ks_t,
+                            mask=pos_mask,
+                            other=1.0,
+                        )
+                        k_kd = (k_kd * k_scale[:, None]).to(q.dtype)
+                k = tl.trans(k_kd)
+            else:
+                k = tl.load(
+                    kv_base
+                    + row_off[None, :]
+                    + off_d[:, None] * stride_kv_d,
+                    mask=d_mask[:, None] & pos_mask[None, :],
+                    other=0.0,
+                )
+                if USE_FP8:
+                    k = k.to(q.dtype)
+                    if KV_SCALE_MODE == 1:
+                        k = (k * tl.load(k_scale_ptr)).to(q.dtype)
+                    elif KV_SCALE_MODE == 2:
+                        k_scale = tl.load(
+                            k_scale_ptr
+                            + pid_kh * stride_ks_h
+                            + (page * BLOCK_SIZE_K + sub_off + off_n)
+                            * stride_ks_t,
+                            mask=pos_mask,
+                            other=1.0,
+                        )
+                        k = (k * k_scale[None, :]).to(q.dtype)
+            qk = tl.zeros((BLOCK_SIZE_H, SUB_K), dtype=tl.float32)
+            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+            qk += tl.dot(q, k) * sm_scale_log2e
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            p = tl.exp2(qk - m_ij[:, None])
+            l_ij = tl.sum(p, axis=1)
+            acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+            v = tl.load(
                 kv_base
-                + off_n[:, None] * stride_kv_pos
-                + off_d[None, :] * stride_kv_d,
+                + row_off[:, None]
+                + (head_dim + off_d[None, :]) * stride_kv_d,
                 mask=pos_mask[:, None] & d_mask[None, :],
                 other=0.0,
             )
             if USE_FP8:
-                k_kd = k_kd.to(q.dtype)
+                v = v.to(q.dtype)
                 if KV_SCALE_MODE == 1:
-                    k_kd = (k_kd * tl.load(k_scale_ptr)).to(q.dtype)
+                    v = (v * tl.load(v_scale_ptr)).to(q.dtype)
                 elif KV_SCALE_MODE == 2:
-                    k_scale = tl.load(
-                        k_scale_ptr
-                        + pid_kh * stride_ks_h
-                        + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                    v_scale = tl.load(
+                        v_scale_ptr
+                        + pid_kh * stride_vs_h
+                        + (page * BLOCK_SIZE_K + sub_off + off_n) * stride_vs_t,
                         mask=pos_mask,
                         other=1.0,
                     )
-                    k_kd = (k_kd * k_scale[:, None]).to(q.dtype)
-            k = tl.trans(k_kd)
-        else:
-            k = tl.load(
-                kv_base
-                + off_n[None, :] * stride_kv_pos
-                + off_d[:, None] * stride_kv_d,
-                mask=d_mask[:, None] & pos_mask[None, :],
-                other=0.0,
-            )
-            if USE_FP8:
-                k = k.to(q.dtype)
-                if KV_SCALE_MODE == 1:
-                    k = (k * tl.load(k_scale_ptr)).to(q.dtype)
-                elif KV_SCALE_MODE == 2:
-                    k_scale = tl.load(
-                        k_scale_ptr
-                        + pid_kh * stride_ks_h
-                        + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
-                        mask=pos_mask,
-                        other=1.0,
-                    )
-                    k = (k * k_scale[None, :]).to(q.dtype)
-        qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-        qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-        qk += tl.dot(q, k) * sm_scale_log2e
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp2(qk - m_ij[:, None])
-        l_ij = tl.sum(p, axis=1)
-        acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-        v = tl.load(
-            kv_base
-            + off_n[:, None] * stride_kv_pos
-            + (head_dim + off_d[None, :]) * stride_kv_d,
-            mask=pos_mask[:, None] & d_mask[None, :],
-            other=0.0,
-        )
-        if USE_FP8:
-            v = v.to(q.dtype)
-            if KV_SCALE_MODE == 1:
-                v = (v * tl.load(v_scale_ptr)).to(q.dtype)
-            elif KV_SCALE_MODE == 2:
-                v_scale = tl.load(
-                    v_scale_ptr
-                    + pid_kh * stride_vs_h
-                    + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
-                    mask=pos_mask,
-                    other=1.0,
-                )
-                v = (v * v_scale[:, None]).to(q.dtype)
-        acc_o += tl.dot(p.to(v.dtype), v)
-        m_i = m_ij
-        lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+                    v = (v * v_scale[:, None]).to(q.dtype)
+            acc_o += tl.dot(p.to(v.dtype), v)
+            m_i = m_ij
+            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -1391,6 +1424,19 @@ def minimax_m3_sparse_attn_decode(
     target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
     num_topk_chunks = 1 << (target.bit_length() - 1)
 
+    # Sub-tiling only applies on Hygon, where LDS staging is the occupancy
+    # limiter; only for divisors of the page that keep the MFMA K dimension
+    # >= 16; and only once the grid is big enough for occupancy to matter.
+    sub_k = SPARSE_BLOCK_SIZE
+    if (
+        current_platform.is_hygon()
+        and 0 < _DECODE_SUB_K < SPARSE_BLOCK_SIZE
+        and SPARSE_BLOCK_SIZE % _DECODE_SUB_K == 0
+        and _DECODE_SUB_K >= 16
+        and total_q * num_kv_heads * num_topk_chunks >= _DECODE_SUB_K_MIN_GRID
+    ):
+        sub_k = _DECODE_SUB_K
+
     # Only tighten the head-axis bound when the tile fits inside the GQA group.
     # BLOCK_SIZE_H > gqa_group_size makes the constexpr-bounded pointers run
     # past this kv_head into the next one -- with the bound removed that is a
@@ -1472,6 +1518,7 @@ def minimax_m3_sparse_attn_decode(
         USE_PDL=use_pdl,
         TIGHT_H=tight_h,
         COALESCE_K=_DECODE_COALESCE_K,
+        SUB_K=sub_k,
         **decode_launch,
         **pdl_launch,
     )
